@@ -64,7 +64,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String _geminiReport = "Press the 'Execute Engine Synthesis' button to analyze target environmental datasets.";
   bool _isAiLoading = false;
   Map<dynamic, dynamic> _cachedHistoryData = {};
-  bool _isAlertWindowActive = false; // Prevents overlapping alert dialog spam
+  
+  // Notification Management Ecosystem
+  bool _isAlertWindowActive = false;     // Prevents overlapping alert dialog spam
+  bool _wasEnvironmentToxic = false;      // State tracking mechanism for Edge-Triggering
+  DateTime? _lastAlertNotificationTime;  // Frequency tracking checkpoint for Cooldown Throttling
   
   String _currentWindowStartStr = "N/A";
   String _currentWindowEndStr = "N/A";
@@ -108,14 +112,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // Initialize Push Notification Services
     await _setupCloudMessaging();
 
-    // Set up out-of-band live stream telemetry inspector to safely trigger alerts without interrupting builds
+    // Set up out-of-band live stream telemetry inspector
     _setupTelemetrySpikeListener();
   }
 
   Future<void> _setupCloudMessaging() async {
     FirebaseMessaging messaging = FirebaseMessaging.instance;
 
-    // Request permissions for foreground notifications (Required for Web, iOS, and Android 13+)
+    // Request permissions for foreground notifications
     NotificationSettings settings = await messaging.requestPermission(
       alert: true,
       badge: true,
@@ -125,7 +129,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (settings.authorizationStatus == AuthorizationStatus.authorized) {
       debugPrint('Cloud Messaging Authorized.');
 
-      // FIX: Only subscribe to topics if NOT running on Web
+      // Only subscribe to topics if NOT running on Web
       if (!kIsWeb) {
         debugPrint('Subscribing to mobile broadcast topic...');
         await messaging.subscribeToTopic('air_quality_alerts');
@@ -134,7 +138,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
     }
 
-    // This listener works on Web to intercept messages while the tab is open
+    // Intercept foreground payload dispatches while app frame is live
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
       if (message.notification != null) {
         _showInAppSpikeDialog(
@@ -151,12 +155,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final int scdCo2 = int.tryParse(liveData['scd_co2']?.toString() ?? '') ?? 0;
       final int pm25 = int.tryParse(liveData['pm2_5']?.toString() ?? '') ?? 0;
 
-      // Evaluate spikes locally from the RTDB Stream pipeline
-      if ((scdCo2 > 1000 || pm25 > 35) && !_isAlertWindowActive) {
-        _showInAppSpikeDialog(
-          "⚠️ TOXIC SPIKE DETECTED",
-          "Immediate intervention required! Live sensor node feeds show structural metrics spiking past nominal ranges.\n\n• Carbon Dioxide: $scdCo2 PPM\n• Particulate Matter (PM2.5): $pm25 µg/m³",
-        );
+      final bool isCurrentlyToxic = (scdCo2 > 1000 || pm25 > 35);
+      final DateTime now = DateTime.now();
+      
+      // Calculate active cooldown constraints (10-minute window)
+      final bool isCooldownOver = _lastAlertNotificationTime == null || 
+          now.difference(_lastAlertNotificationTime!) > const Duration(minutes: 10);
+
+      if (isCurrentlyToxic) {
+        // Trigger dialog ONLY if there's no active modal window, AND it's either a clean 
+        // baseline transition (Edge-Triggered) OR the cooldown throttling block has expired.
+        if (!_isAlertWindowActive && (!_wasEnvironmentToxic || isCooldownOver)) {
+          _lastAlertNotificationTime = now;
+          _wasEnvironmentToxic = true; 
+
+          _showInAppSpikeDialog(
+            "⚠️ TOXIC SPIKE DETECTED",
+            "Immediate intervention required! Live sensor node feeds show structural metrics spiking past nominal ranges.\n\n• Carbon Dioxide: $scdCo2 PPM\n• Particulate Matter (PM2.5): $pm25 µg/m³",
+          );
+        }
+      } else {
+        // Safe condition met: Reset edge tracking flag state
+        _wasEnvironmentToxic = false;
       }
     });
   }
@@ -320,13 +340,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       double medianPm25 = _getMedianValue(pm25Logs);
       double medianPm10 = _getMedianValue(pm10Logs);
 
-      // Extract directly using standard developer pipeline keys
       final apiKey = dotenv.env['GOOGLE_AI_API_KEY'];
       if (apiKey == null || apiKey.isEmpty) {
         throw Exception("Missing GOOGLE_AI_API_KEY inside project environment setups.");
       }
 
-      // Initialize utilizing standard direct production model engine configuration
       final modelInstance = GenerativeModel(
         model: 'gemini-2.5-flash', 
         apiKey: apiKey,
@@ -626,7 +644,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                         ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white54))
                                         : const Icon(Icons.bolt, size: 16),
                                       label: Text(
-                                        "EXECUTE ENGINE SYNTHESIS (2-MIN MEDIANS)",
+                                        "EXECUTE ENGINE SYNTHESIS",
                                         style: GoogleFonts.orbitron(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
                                       ),
                                       style: OutlinedButton.styleFrom(
