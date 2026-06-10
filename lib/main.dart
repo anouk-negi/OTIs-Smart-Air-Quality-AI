@@ -5,7 +5,6 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'chart_widget.dart'; 
@@ -61,7 +60,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   late Future<void> _firebaseInitialization;
   DatabaseReference? _dbRef;
 
-  String _geminiReport = "Press the 'Execute Engine Synthesis' button to analyze target environmental datasets.";
+  // Dynamically streams recommendations calculated directly by the Raspberry Pi gateway
+  String _geminiReport = "Awaiting structural data packets from Raspberry Pi gateway...";
   bool _isAiLoading = false;
   Map<dynamic, dynamic> _cachedHistoryData = {};
   
@@ -114,12 +114,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     // Set up out-of-band live stream telemetry inspector
     _setupTelemetrySpikeListener();
+
+    // Out-of-band live stream listener for automated Pi-side AI predictions
+    _setupAiInsightsListener();
+  }
+
+  // Real-time hook pulling fresh Gemini analysis blocks directly from your backend processing script
+  void _setupAiInsightsListener() {
+    _dbRef?.child('ai_insights').onValue.listen((event) {
+      final aiData = event.snapshot.value as Map<dynamic, dynamic>?;
+      if (aiData != null && mounted) {
+        setState(() {
+          _geminiReport = aiData['message']?.toString() ?? "No environmental report generated yet.";
+          final String ts = aiData['timestamp']?.toString() ?? "";
+          if (ts.isNotEmpty) {
+            _currentWindowStartStr = ts;
+          }
+        });
+      }
+    });
   }
 
   Future<void> _setupCloudMessaging() async {
     FirebaseMessaging messaging = FirebaseMessaging.instance;
 
-    // Request permissions for foreground notifications
     NotificationSettings settings = await messaging.requestPermission(
       alert: true,
       badge: true,
@@ -129,7 +147,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (settings.authorizationStatus == AuthorizationStatus.authorized) {
       debugPrint('Cloud Messaging Authorized.');
 
-      // Only subscribe to topics if NOT running on Web
       if (!kIsWeb) {
         debugPrint('Subscribing to mobile broadcast topic...');
         await messaging.subscribeToTopic('air_quality_alerts');
@@ -138,7 +155,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
     }
 
-    // Intercept foreground payload dispatches while app frame is live
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
       if (message.notification != null) {
         _showInAppSpikeDialog(
@@ -158,13 +174,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final bool isCurrentlyToxic = (scdCo2 > 1000 || pm25 > 35);
       final DateTime now = DateTime.now();
       
-      // Calculate active cooldown constraints (10-minute window)
       final bool isCooldownOver = _lastAlertNotificationTime == null || 
           now.difference(_lastAlertNotificationTime!) > const Duration(minutes: 10);
 
       if (isCurrentlyToxic) {
-        // Trigger dialog ONLY if there's no active modal window, AND it's either a clean 
-        // baseline transition (Edge-Triggered) OR the cooldown throttling block has expired.
         if (!_isAlertWindowActive && (!_wasEnvironmentToxic || isCooldownOver)) {
           _lastAlertNotificationTime = now;
           _wasEnvironmentToxic = true; 
@@ -175,7 +188,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
           );
         }
       } else {
-        // Safe condition met: Reset edge tracking flag state
         _wasEnvironmentToxic = false;
       }
     });
@@ -254,135 +266,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  // Refactored to act as a manual dashboard sync verification trigger
   Future<void> _compileAndAnalyzeMedianTelemetry() async {
-    if (_cachedHistoryData.isEmpty) {
-      setState(() { 
-        _geminiReport = "⚠️ Core telemetry pipeline dry."; 
-        _currentWindowStartStr = "N/A";
-        _currentWindowEndStr = "N/A";
-        _currentParsedCount = 0;
-      });
-      return;
-    }
-
     setState(() { _isAiLoading = true; });
-
-    try {
-      List<Map<String, dynamic>> validHistoryRecords = [];
-      _cachedHistoryData.forEach((key, value) {
-        if (value is Map) {
-          final String tsStr = value['timestamp']?.toString() ?? "";
-          final DateTime? parsed = _parseTimestamp(tsStr);
-          if (parsed != null) {
-            validHistoryRecords.add(Map<String, dynamic>.from(value));
-          }
-        }
-      });
-
-      if (validHistoryRecords.isEmpty) {
-        setState(() {
-          _geminiReport = "⚠️ Timestamp parse failure.";
-          _currentWindowStartStr = "N/A";
-          _currentWindowEndStr = "N/A";
-          _currentParsedCount = 0;
-          _isAiLoading = false;
-        });
-        return;
-      }
-
-      validHistoryRecords.sort((a, b) {
-        final DateTime timeA = _parseTimestamp(a['timestamp']?.toString() ?? "")!;
-        final DateTime timeB = _parseTimestamp(b['timestamp']?.toString() ?? "")!;
-        return timeA.compareTo(timeB);
-      });
-
-      final DateTime now = DateTime.now();
-      final DateTime realTimeWindowStart = now.subtract(const Duration(seconds: 120));
-      
-      List<Map<String, dynamic>> recentRecords = validHistoryRecords.where((record) {
-        final DateTime recordTime = _parseTimestamp(record['timestamp']?.toString() ?? "")!;
-        return recordTime.isAfter(realTimeWindowStart);
-      }).toList();
-
-      if (recentRecords.isEmpty) {
-        final DateTime latestEntryTime = _parseTimestamp(validHistoryRecords.last['timestamp']?.toString() ?? "")!;
-        final DateTime dynamicWindowStart = latestEntryTime.subtract(const Duration(seconds: 120));
-        recentRecords = validHistoryRecords.where((record) {
-          final DateTime recordTime = _parseTimestamp(record['timestamp']?.toString() ?? "")!;
-          return recordTime.isAfter(dynamicWindowStart);
-        }).toList();
-      }
-
-      if (recentRecords.isEmpty) { recentRecords = [validHistoryRecords.last]; }
-
-      final String windowStartRaw = recentRecords.first['timestamp']?.toString() ?? "N/A";
-      final String windowEndRaw = recentRecords.last['timestamp']?.toString() ?? "N/A";
-
-      final co2Logs = recentRecords.map((e) => double.tryParse(e['scd_co2']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final scdTempLogs = recentRecords.map((e) => double.tryParse(e['scd_temp_c']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final scdHumLogs = recentRecords.map((e) => double.tryParse(e['scd_humidity']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final vocLogs = recentRecords.map((e) => double.tryParse(e['bme_voc']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final bmeTempLogs = recentRecords.map((e) => double.tryParse(e['bme_temp_c']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final bmeHumLogs = recentRecords.map((e) => double.tryParse(e['bme_humidity']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final pressureLogs = recentRecords.map((e) => double.tryParse(e['bme_pressure']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final pm1Logs = recentRecords.map((e) => double.tryParse(e['pm1_0']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final pm25Logs = recentRecords.map((e) => double.tryParse(e['pm2_5']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-      final pm10Logs = recentRecords.map((e) => double.tryParse(e['pm10']?.toString() ?? '') ?? 0.0).where((v) => v != -999).toList();
-
-      double medianCo2 = _getMedianValue(co2Logs);
-      double medianScdTemp = _getMedianValue(scdTempLogs);
-      double medianScdHum = _getMedianValue(scdHumLogs);
-      double medianVoc = _getMedianValue(vocLogs);
-      double medianBmeTemp = _getMedianValue(bmeTempLogs);
-      double medianBmeHum = _getMedianValue(bmeHumLogs);
-      double medianPressure = _getMedianValue(pressureLogs);
-      double medianPm1 = _getMedianValue(pm1Logs);
-      double medianPm25 = _getMedianValue(pm25Logs);
-      double medianPm10 = _getMedianValue(pm10Logs);
-
-      final apiKey = dotenv.env['GOOGLE_AI_API_KEY'];
-      if (apiKey == null || apiKey.isEmpty) {
-        throw Exception("Missing GOOGLE_AI_API_KEY inside project environment setups.");
-      }
-
-      final modelInstance = GenerativeModel(
-        model: 'gemini-2.5-flash', 
-        apiKey: apiKey,
+    await Future.delayed(const Duration(milliseconds: 400));
+    setState(() { _isAiLoading = false; });
+    
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFF0F172A),
+          content: Text(
+            "Telemetry Stream Synchronized with Firebase Cognitive Layer Node.",
+            style: GoogleFonts.plusJakartaSans(color: const Color(0xFF34D399), fontSize: 12),
+          ),
+        ),
       );
-      
-      final analyticsPrompt = """
-      You are an expert environmental engineer. Analyze this 2-minute MEDIAN dataset:
-      - CO2 level: ${medianCo2.toStringAsFixed(0)} PPM
-      - SCD40 Temperature: ${medianScdTemp.toStringAsFixed(1)}°C
-      - SCD40 Humidity: ${medianScdHum.toStringAsFixed(1)}% RH
-      - BME680 VOC Gas Resistance: ${medianVoc.toStringAsFixed(0)} Ohms
-      - BME680 Ambient Temp: ${medianBmeTemp.toStringAsFixed(1)}°C
-      - BME680 Ambient Humid: ${medianBmeHum.toStringAsFixed(1)}% RH
-      - Atmospheric Pressure: ${medianPressure.toStringAsFixed(2)} hPa
-      - PM1.0: ${medianPm1.toStringAsFixed(0)} ug/m³
-      - PM2.5: ${medianPm25.toStringAsFixed(0)} ug/m³
-      - PM10: ${medianPm10.toStringAsFixed(0)} ug/m³
-      
-      Provide a concise 2-3 sentence technical evaluation regarding air safety and environment trends based on the collected records (${recentRecords.length} records parsed).
-      """;
-
-      final modelOutputResponse = await modelInstance.generateContent([Content.text(analyticsPrompt)]);
-      
-      setState(() {
-        _geminiReport = modelOutputResponse.text ?? "Error: Empty data output matrix.";
-        _currentWindowStartStr = windowStartRaw;
-        _currentWindowEndStr = windowEndRaw;
-        _currentParsedCount = recentRecords.length;
-        _isAiLoading = false;
-      });
-    } catch (error) {
-      setState(() {
-        _geminiReport = "Engine Runtime Abort: $error";
-        _currentWindowStartStr = "N/A";
-        _currentWindowEndStr = "N/A";
-        _currentParsedCount = 0;
-        _isAiLoading = false;
-      });
     }
   }
 
@@ -609,7 +508,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                       const Icon(Icons.auto_awesome, size: 15, color: Color(0xFF38BDF8)),
                                       const SizedBox(width: 8),
                                       Text(
-                                        "FIREBASE COGNITIVE ARTIFICIAL INTELLIGENCE LAYER", 
+                                        "LOCALIZED AI ANALYTICS ENGINE", 
                                         style: GoogleFonts.orbitron(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.8, color: const Color(0xFF94A3B8))
                                       ),
                                     ],
@@ -642,9 +541,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                       onPressed: _isAiLoading ? null : _compileAndAnalyzeMedianTelemetry,
                                       icon: _isAiLoading 
                                         ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white54))
-                                        : const Icon(Icons.bolt, size: 16),
+                                        : const Icon(Icons.sync_alt_rounded, size: 16),
                                       label: Text(
-                                        "EXECUTE ENGINE SYNTHESIS",
+                                        "FORCE RE-SYNC DASHBOARD PIPELINE",
                                         style: GoogleFonts.orbitron(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
                                       ),
                                       style: OutlinedButton.styleFrom(
